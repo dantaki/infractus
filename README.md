@@ -14,7 +14,6 @@ perl INSTALL.pl
 * [Getopt::Long](http://search.cpan.org/~jv/Getopt-Long-2.49.1/lib/Getopt/Long.pm)
 * [Statistics::Basic](http://search.cpan.org/~jettero/Statistics-Basic-1.6611/lib/Statistics/Basic.pod)
 * [Term::ProgressBar](http://search.cpan.org/~szabgab/Term-ProgressBar-2.17/lib/Term/ProgressBar.pm)
-
 * [samtools](http://www.htslib.org/)
 
 ## Usage
@@ -43,9 +42,9 @@ Option | Description
 
 #### BAM
 
-infractus requires single-read alignments with suppplementary alignments (SA: tag).
+infractus requires single-reads with suppplementary alignments (SA: tag).
 
-`-b,--bam` accepts either a file or a path, where all files that end in `.bam` will be analyzed. 
+`-b,--bam` accepts either a file or a path. Given a path all files that end in `.bam` will be analyzed. 
 
 #### BED
 
