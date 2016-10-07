@@ -1,0 +1,302 @@
+#!/usr/bin/env perl
+#Version 0.2
+#Author: Danny Antaki <dantaki@ucsd.edu>
+use strict; use warnings;
+use File::Basename;
+use Statistics::Basic qw(mean);
+our $IPATH = dirname(__FILE__);
+our $DATA = $IPATH."/data/";
+use Getopt::Long qw(GetOptions);
+use Term::ProgressBar;
+our $sttime=time; 
+my $splash='
+
+::::::.    :::..-:::::\':::::::..    :::.       .,-:::::::::::::::::...    ::: .::::::. 
+;;;`;;;;,  `;;;;;;\'\'\'\' ;;;;``;;;;   ;;`;;    ,;;;\'````\';;;;;;;;\'\'\'\';;     ;;;;;;`    ` 
+[[[  [[[[[. \'[[[[[,,==  [[[,/[[[\'  ,[[ \'[[,  [[[            [[    [[\'     [[[\'[==/[[[[,
+$$$  $$$ "Y$c$$`$$$"``  $$$$$$c   c$$$cc$$$c $$$            $$    $$      $$$  \'\'\'    $
+888  888    Y88 888     888b "88bo,888   888,`88bo,__,o,    88,   88    .d888 88b    dP
+MMM  MMM     YM "MM,    MMMM   "W" YMM   ""`   "YUMMMMMP"   MMM    "YmmMMMM""  "YMmMY" 
+
+Validate deletions, tandem duplications, and inversions with single-reads.
+Version 0.2
+Author: Danny Antaki <dantaki@ucsd.edu>';
+# arguments
+my $bam = 0;
+my $bed = 0;
+our  $cpu = 1;
+our $flank=150;
+our $q=20;
+our $span=0.8;
+my $out = "infractus_supporting_reads.txt";
+my $help=0;
+my $HELP = "infractus -b,--bam [BAM] -l,--bed [BED] -c,--cpu [CPU] -f,--flank [FLANKING BP] -q,--qual [MAPPING QUALITY] -s,--span [MINIMUM OVERLAP] -o,--out [OUTPUT] -h,--help [HELP]";
+my $USEAGE = "Useage:    infractus [OPTION]...\nValidate SV in single-read BWA-MEM alignments\n\nOptions:\n  -b,--bam        BAM file\n  -l,--bed        BED file containing SV to validate\n  -c,--cpu        number of threads for samtools view -@\n  -f,--flank      base pairs to extend SV position. Default 150bp\n  -q,--qual       mapping quality. Default 20\n  -s,--span       minimum reciprocal overlap to input. Default 80%\n  -o,--out        output\n  -h,--help       help\n";    
+GetOptions(
+	'bam|b=s' => \$bam,
+	'bed|l=s' => \$bed,
+	'cpu|c=i' => \$cpu,
+	'flank|f=i' => \$flank,
+	'qual|q=i' => \$q,
+	'span|s=f' => \$span,
+	'out|o=s' => \$out,
+	'help|h' => \$help,
+) or die "$splash\n\n$HELP\n";
+# global variables
+our %chrOrder; # bam -> @chrom order of chromosomes 
+our %id; # bam -> sample
+# main
+die "$splash\n\n$USEAGE\n" if ($help || $bam eq "0");
+my $bams = bam($bam);
+undef my @split;
+if(! -e $bed) { die "ERROR $bed DOES NOT EXIST\n"; }
+open OUT, ">".$out;
+print OUT "#BAM\tCHR\tSTART\tEND\tLENGTH\tTYPE\tSUPPORTING_READS\tBREAKPOINTS\n"; 
+foreach my $bf (@$bams){ bamhead($bf);
+	my($support) = infractus($bf,$bed);
+	foreach my $bb (sort keys %$support){
+	foreach my $c (sort {$a<=>$b} keys %{$$support{$bb}}){
+	my $cc=$c; $cc =~ s/23/X/; $cc =~ s/24/Y/;
+	foreach my $s (sort {$a<=>$b} keys %{$$support{$bb}{$c}}){
+	foreach my $k (sort keys %{$$support{$bb}{$c}{$s}}){
+	my ($e,$cl) = split /\t/, $k; my $sz=$e-$s+1;
+	if ($$support{$bb}{$c}{$s}{$k}==0){ print OUT "$bb\tchr$cc\t$s\t$e\t$sz\t$cl\t0\tNA\n";} 
+	else { my $sr=0; undef my @brks; 
+	foreach my $read (keys %{$$support{$bb}{$c}{$s}{$k}}) { $sr++; 
+	foreach (keys %{$$support{$bb}{$c}{$s}{$k}{$read}}){ push @brks, $_ if $_ ne "NA"; }} 
+	my $brks="NA";
+	if(@brks>0){ $brks = join ",", uniq(@brks);} 
+	print OUT "$bb\tchr$cc\t$s\t$e\t$sz\t$cl\t$sr\t$brks\n"; 
+	}}}}}}
+sub bamhead{
+        # input bam file
+        undef my %check;
+        my $bam = shift @_;
+        my @bb = split /\//, $bam; my $bb = pop @bb;
+        open (my $head, '-|', 'samtools', 'view', '-H', $bam) or die "FATAL ERROR: is samtools IN YOU \$PATH\n";
+        while(<$head>){
+        chomp $_;
+        my @r = split /\t/, $_;
+        if($_ =~ /^\@SQ/){
+	undef my $c; 
+	foreach(@r){ if ($_ =~ /^SN:/) { $c=$_; }}
+        $c =~ s/SN://;
+        push @{$chrOrder{$bam}}, $c;} 
+        if($_ =~ /^\@RG/){
+        my $id=$bb;
+        foreach(@r) { if($_ =~ /^SM:/) { $id=$_; } }
+        $id =~ s/SM://; $id{$bam}=$id;$check{$id}++;}
+        }close $head;
+        $id{$bam}=$bb unless(exists $id{$bam});
+        my $cc=0;
+        undef my @i;
+        foreach(keys %check) { push @i, $_; $cc++;}
+        my $ii = join " ",@i;
+        die "FATAL ERROR: More than one sample ID found in $bam: $ii\n" if($cc > 1);
+}
+sub bed {
+	# sort bed file
+	# input: bed, bam
+	undef my @sorted;
+	undef my %sv;
+	my ($f,$bam) = @_;
+	my $cF=0; my $term=0; foreach (@{$chrOrder{$bam}}){ if($term==0){ $cF=1 if($_ =~ /^chr/); $term++; } }
+	open IN, $f;
+	while(<IN>){ chomp;
+	my @r = split /\t/, $_;
+	my ($c,$s,$e,$cl) = @r[0 .. 3];
+	$c =~ s/chr//; $c = "chr".$c if($cF==1);
+	my @k = ($c,$s,$e,$cl); push @{$sv{$c}{$s}}, \@k;
+	}close IN;
+	foreach my $c (@{$chrOrder{$bam}}){
+	next unless(exists $sv{$c});
+	foreach my $s (sort {$a<=>$b} keys %{$sv{$c}}){
+	foreach my $k (@{$sv{$c}{$s}}){ push @sorted, $k; }}}
+	return \@sorted;
+}
+sub bam {
+	# takes user input and returns list of BAM files
+	undef my @bam;
+	my $b = shift @_;
+	if (-e $b && !-d $b) { push @bam, $b; }
+	elsif (-d $b){ 
+	if ($b !~ /\/$/) { $b=$b."/"; }
+	foreach (glob($b."*.bam")){ push @bam, $_; }
+	if (scalar(@bam)==0){ die "ERROR NO BAM FILES FOUND IN $b\n"; } 
+	} else { die "ERROR $b IS NOT A BAM FILE OR AN EXISTING DIRECTORY\n"; }
+	return \@bam;
+}
+sub infractus{
+	# Input: bam file, bed file, cpus
+	# Checks bed chr compatibility
+	my ($bam,$bed) = @_;
+	undef my %support; 
+	my $bb = $id{$bam};
+	my $lc = `wc -l < $bed`; $lc--;
+	my $progress = Term::ProgressBar->new({name  => "$bb <finding breaks>",count => $lc, ETA => 'linear', });
+	$progress->max_update_rate(1);
+	my $next_update=0;
+	my $sorted = bed($bed,$bam);
+	my $cc=0;
+	foreach(@$sorted){
+	my ($c,$s,$e,$cl) = @{$_};
+	my $sz=$e-$s+1;
+	undef my @cov;
+	my $region = $c.":".$s."-".$e;
+	my $normCov = "NA";
+	undef my %brkpt;
+	open (my $sam, '-|', 'samtools', 'view', '-q', $q, '-@', $cpu,$bam,$region);
+	while(<$sam>){
+		next unless($_ =~ /SA\:/);
+		my $SA = parseSA($_);
+		next if($SA eq "0"); 
+		foreach my $sup (@$SA){
+		my ($spC,$spP,$spS,$spCig) = @$sup;
+		chomp $_;
+		my @r = split /\t/, $_;
+		next if($spC ne $r[2]);
+		my $bitflag=$r[1];
+		my $cigar=$r[5];
+		my $rev=0; #reverse stand 1==True 
+		my $supp=0; #supplementary alignment 1==True
+		if($bitflag & 16) { $rev=1; }
+		if($bitflag & 2048 || $bitflag & 256) { $supp=1; } 
+		if($cl =~ /INV/){
+			if($rev==0 && $supp==0 && $spS eq "-")  { #forward strand/primary alignment 
+				$brkpt{$r[0]}{rightPos($r[3],$cigar)}++; $brkpt{$r[0]}{rightPos($spP,$spCig)}++; 	
+			}
+			elsif($rev==1 && $supp==0 && $spS eq "+"){ #reverse strand/primary alignment 
+				$brkpt{$r[0]}{$r[3]}++; $brkpt{$r[0]}{$spP}++; 
+			}
+		}
+		if($cl =~ /DEL/){
+			next if (($rev==0 && $spS eq "-") || ($rev==1 && $spS eq "+"));	
+			if($rev==0){ #forward strand
+			if($supp==0) {  #primary alignment
+				$brkpt{$r[0]}{$spP}++; $brkpt{$r[0]}{rightPos($r[3],$cigar)}++; }
+			else { #supplementary alignment
+				$brkpt{$r[0]}{$r[3]}++; $brkpt{$r[0]}{rightPos($spP,$spCig)}++; }
+			} else { #reverse strand
+			if($supp==0){ #primary alignment
+				$brkpt{$r[0]}{$r[3]}++; $brkpt{$r[0]}{rightPos($spP,$spCig)}++;}
+			else {  #supplementary alignment
+				$brkpt{$r[0]}{rightPos($r[3],$cigar)}++; $brkpt{$r[0]}{$spP}++; }  }	}
+		elsif($cl =~ /DUP/){
+			next if (($rev==0 && $spS eq "-") || ($rev==1 && $spS eq "+"));	
+			$c =~ s/chr//; $c =~ s/X/23/; $c =~ s/Y/24/;
+			my $bpOvr = checkOverlap($r[3],$cigar,$spP,$spCig);
+			if($bpOvr eq 0){ #non-overlapping split reads 
+				$brkpt{$r[0]}{$r[3]}++; $brkpt{$r[0]}{$spP}++;
+			} else { #overlapping split reads
+				my ($bpOvrr,$smax,$emin) = @$bpOvr;
+				my $brkSpan = spanit($s,$e,$smax,$emin);
+				$support{$bb}{$c}{$s}{$e."\t".$cl}{$r[0]}{"OVR;$smax-$emin:".sprintf("%.2f",$brkSpan)}++ if $brkSpan >= $span; }}}
+		} close $sam;
+		$c =~ s/chr//; $c =~ s/X/23/; $c =~ s/Y/24/;
+		foreach my $r (keys %brkpt) { 
+		undef my @break;
+		foreach (keys %{$brkpt{$r}}) { push @break, $_; }
+		next if(scalar(@break)) != 2; #omit breakpoints of 1bp
+		my($bks,$bke) = sort {$a<=>$b} @break;
+		$bke--; 
+		next unless($bks < $e && $s < $bke); # skip non-overlapping breaks
+		my $brkSpan = spanit($s,$e,$bks,$bke);
+		if(flankit($s,0) <= $bks && flankit($e,1) >= $bke && $brkSpan >= $span) { $support{$bb}{$c}{$s}{$e."\t".$cl}{$r}{$bks."-".$bke.":".sprintf("%.2f",$brkSpan)}++; } }
+		unless(exists $support{$bb}{$c}{$s}{$e."\t".$cl}) { $support{$bb}{$c}{$s}{$e."\t".$cl}=0; } 
+		$next_update = $progress->update($cc) if $cc > $next_update;
+		$cc++;
+	}close IN;
+	$progress->update($lc) if $lc >= $next_update; 
+	report("$bb complete: ".timeFormat(time));	
+	return \%support;
+}
+sub checkOverlap {
+	#return base pair overlap of two alignments
+	#input: left pos1, cigar1, left pos2, cigar2
+	my ($p1,$c1,$p2,$c2) = @_;
+	my @s = sort {$b<=>$a} ($p1,$p2);
+	my @e = sort {$a<=>$b} (rightPos($p1,$c1),rightPos($p2,$c2));
+	my $smax=shift @s; my $emin=shift @e;
+	my $bp = $emin-$smax+1; 
+	my @result = ($bp,$smax,$emin);
+	if($bp <=0) { return 0; } else { return \@result; } 
+}
+sub spanit {
+	#return reciprocal overlap of break to CNV
+	#input: start end, breakStart, breakEnd
+	my ($s1,$e1,$s2,$e2) = @_;
+	my @s = ($s1,$s2);
+	my @e = ($e1,$e2);
+	@s = sort{$b<=>$a} @s;
+	@e = sort{$a<=>$b} @e;
+	my $smax=shift @s; my $emin=shift @e;
+	undef my @ovrs;
+	push @ovrs, ($emin-$smax+1)/($e1-$s1+1); push @ovrs, ($emin-$smax+1)/($e2-$s2+1);
+	@ovrs = sort {$a<=>$b} @ovrs;
+	return shift @ovrs;
+}
+sub flankit {
+	#add flanking bp to CNV positions
+	my ($p,$f) = @_;
+	if ($f==0) { $p-=$flank; }
+	else { $p+=$flank; }
+	return $p;
+}
+sub rightPos{
+	#return the right most position 
+	#input: position, cigar string
+	my ($p,$cigar) = @_;
+	my $len=0;
+	$cigar =~ s/\=/Q/;
+	my @cigar = split /([A-Z])/, $cigar;
+	for (my $i=0; $i<scalar(@cigar)-1; $i+=2){if($cigar[$i+1] =~ /[MDNQXP]/) { $len+=$cigar[$i];}}
+	return $p+$len-1
+}
+sub readlen{
+	#returns length of the read
+	#input: position, cigar string
+	my ($p,$cigar) = @_;
+        my $len=0;
+        $cigar =~ s/\=/Q/;
+        my @cigar = split /([A-Z])/, $cigar;
+        for (my $i=0; $i<scalar(@cigar)-1; $i+=2){if($cigar[$i+1] =~ /[MDNQXP]/) { $len+=$cigar[$i];}}
+        return $len
+}
+sub parseSA {
+	#return an array of supplementary alignments
+	#input: read in SAM format
+	my @r = split /\t/, shift @_;
+	undef my $c;
+	undef my $p;
+	undef my $s;
+	undef my $cig;
+	undef my @SA;
+	my $chrom = $r[2];
+	foreach(@r) { 
+	if($_ =~ /^SA/) {
+	my $SA = $_;
+	$SA =~ s/SA:Z://;
+	my @sa = split /\;/, $SA;
+	foreach(@sa){
+	my @saa = split /,/, $_;
+	$c = shift @saa; 
+	$p = shift @saa; $s = shift @saa; $cig= shift @saa;
+	my @sub = ($c,$p,$s,$cig);
+	push @SA, \@sub if $c eq $chrom;}}}
+	if(scalar(@SA)==0) { return 0; } 
+	else { return \@SA; } 	
+}
+sub report {my $s = shift @_;print "\n","-" x length $s,"\n$s\n","-" x length $s,"\n"; }
+sub timeFormat {
+	my $endTime=shift @_;	
+	my $elapse = $endTime-$sttime;
+	my $t="s";
+	if ($elapse > 60) { $t="m"; $elapse=$elapse/60; }
+	if ($elapse > 60) { $t="h"; $elapse=$elapse/60; } 
+	$elapse = sprintf("%.1f", $elapse);
+	return "Elapsed Time: <$elapse$t>";
+}
+sub uniq {
+	my %seen;
+	grep !$seen{$_}++, @_;
+}
